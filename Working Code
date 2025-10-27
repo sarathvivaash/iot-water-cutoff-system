@@ -1,0 +1,222 @@
+## Main Module Code
+
+#include <RH_ASK.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+
+// RF Receiver
+RH_ASK driver(2000, 33, 0, 0);  // RX = GPIO33
+
+// Motor Driver Pins
+#define IN1 26
+#define IN2 27
+
+// Switches
+#define PB 13   // Push Button
+#define MS 14   // Manual/Auto Switch
+
+// LCD
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// WiFi Credentials
+const char *ssid = "I Am Watching You";
+const char *password = "sarath0911";
+
+// Server URL
+const char* serverUrl = "http://192.168.128.159:5000/data";
+
+float distance = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(PB, INPUT);
+  pinMode(MS, INPUT);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi...");
+  int retries = 20;
+  while (WiFi.status() != WL_CONNECTED && retries-- > 0) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected!");
+    lcd.setCursor(0, 1);
+    lcd.print("WiFi Connected");
+  } else {
+    Serial.println("\nWiFi Failed!");
+    lcd.setCursor(0, 1);
+    lcd.print("WiFi Failed");
+  }
+
+  delay(2000);
+  lcd.clear();
+
+  configTime(19800, 0, "pool.ntp.org");
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo)) {
+    Serial.println("Waiting for time sync...");
+    delay(500);
+  }
+
+  if (!driver.init()) {
+    Serial.println("RF Init failed");
+    lcd.setCursor(0, 1);
+    lcd.print("RF Init Failed");
+  } else {
+    Serial.println("RF Ready");
+    lcd.setCursor(0, 1);
+    lcd.print("RF Ready");
+  }
+
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  uint8_t buf[RH_ASK_MAX_MESSAGE_LEN];
+  uint8_t buflen = sizeof(buf);
+  int push = digitalRead(PB);
+  int manauto = digitalRead(MS);
+  String motorStatus = "IDLE";
+
+  if (driver.recv(buf, &buflen)) {
+    buf[buflen] = '\0';
+    distance = atof((char*)buf);
+
+    Serial.print("Distance: ");
+    Serial.print(distance);
+    Serial.println(" cm");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Distance:");
+    lcd.setCursor(10, 0);
+    lcd.print(distance);
+    lcd.print("cm");
+
+    // AUTO MODE
+    if (manauto == HIGH) {
+      if (distance > 8) {
+        digitalWrite(IN1, HIGH);
+        digitalWrite(IN2, LOW);
+        motorStatus = "ON";
+        lcd.setCursor(0, 1);
+        lcd.print("Pump ON ");
+      } else if (distance < 5) {
+        digitalWrite(IN1, LOW);
+        digitalWrite(IN2, LOW);
+        motorStatus = "OFF";
+        lcd.setCursor(0, 1);
+        lcd.print("Pump OFF");
+      } else {
+        digitalWrite(IN1, LOW);
+        digitalWrite(IN2, LOW);
+        motorStatus = "IDLE";
+        lcd.setCursor(0, 1);
+        lcd.print("Pump IDLE");
+      }
+    }
+
+    // MANUAL MODE
+    if (manauto == LOW) {
+      if (push == HIGH) {
+        digitalWrite(IN1, HIGH);
+        digitalWrite(IN2, LOW);
+        motorStatus = "ON";
+        lcd.setCursor(0, 1);
+        lcd.print("Pump ON ");
+      } else {
+        digitalWrite(IN1, LOW);
+        digitalWrite(IN2, LOW);
+        motorStatus = "OFF";
+        lcd.setCursor(0, 1);
+        lcd.print("Pump OFF");
+      }
+    }
+
+    // Send data to server
+    struct tm timeinfo;
+    getLocalTime(&timeinfo);
+    char timestamp[25];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      http.begin(serverUrl);
+      http.addHeader("Content-Type", "application/json");
+
+      String postData = "{";
+      postData += "\"distance\":" + String(distance) + ",";
+      postData += "\"motor_status\":\"" + motorStatus + "\",";
+      postData += "\"timestamp\":\"" + String(timestamp) + "\"";
+      postData += "}";
+
+      int httpResponseCode = http.POST(postData);
+      Serial.print("HTTP Response: ");
+      Serial.println(httpResponseCode);
+      http.end();
+    }
+  }
+ delay(1000);
+
+## Tank Module Code
+#include <RH_ASK.h>
+#include <SPI.h>
+
+#define TRIG_PIN 5   // Trigger Pin for HC-SR04
+#define ECHO_PIN 18  // Echo Pin for HC-SR04
+
+RH_ASK driver(2000, 0, 4, 0);  // TX on GPIO4
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    if (!driver.init()) {
+        Serial.println("RF Transmitter Failed!");
+    }
+}
+
+void loop() {
+    // Measure distance
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+    
+    long duration = pulseIn(ECHO_PIN, HIGH);
+    float distance = duration * 0.034 / 2;  // Convert time to distance (cm)
+
+    // Convert distance to string
+    char message[10];
+    dtostrf(distance, 4, 2, message);  // Format as string
+
+    // Send distance via RF
+    driver.send((uint8_t *)message, strlen(message));
+    driver.waitPacketSent();
+    
+    Serial.print("Distance Sent: ");
+    Serial.print(distance);
+    Serial.println(" cm");
+
+    delay(1000);  // Send data every second
+}
+}
